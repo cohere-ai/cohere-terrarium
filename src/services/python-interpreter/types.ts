@@ -11,15 +11,14 @@ export interface CodeExecutionResponse {
     code_runtime?: number;
 }
 
-export interface FileData { 
+export interface FileData {
     filename: string;
     data: Buffer;
 }
 
-export interface PythonEnvironment { 
+export interface PythonEnvironment {
     init(): Promise<void>;
     waitForReady(): Promise<void>;
     runCode(code: string, files: any[]): Promise<CodeExecutionResponse>;
-    cleanup(): Promise<void>;
-    terminate() : Promise<void>;
+    terminate(): Promise<void>;
 }
