@@ -23,13 +23,17 @@ async function runRequest(req: any, res: any): Promise<void> {
     await pythonEnvironment.waitForReady();
 
     //
-    // parse the request body (code & files)
+    // parse the request body (code, files, and sessionId)
     //
     const code = req.body.code
     if (code == undefined || code.trim() == "") {
         res.send(JSON.stringify({ "success": false, "error": { "type": "parsing", "message": "no code provided" } }) + "\n");
         return
     }
+
+    // Extract the session ID (optional)
+    const sessionId = req.body.sessionId;
+
     let files: any[] = [] // { "filename": "file.txt", "b64_data": "dGhlc..." }]
     if (req.body.files != undefined) {
         files = req.body.files
@@ -37,18 +41,23 @@ async function runRequest(req: any, res: any): Promise<void> {
         console.log(files.map(f => f.filename + " " + f.b64_data.slice(0, 10) + "... " + f.b64_data.length))
     }
 
-    const result = await pythonEnvironment.runCode(code, files);
+    const result = await pythonEnvironment.runCode(code, files, sessionId);
 
     // write out the answer, but do not close the response yet - otherwise gcp cloud functions terminate the cpu cycles and hibernate the recycling
     res.write(JSON.stringify(result) + "\n");
 
-    console.log("Reloading pyodide");
+    // Only recycle the environment if not using sessions (for backward compatibility)
+    if (!sessionId) {
+        console.log("Reloading pyodide for stateless execution");
 
-    // run the recycle background process'
-    // see https://cloud.google.com/functions/docs/bestpractices/tips#do_not_start_background_activities
+        // run the recycle background process'
+        // see https://cloud.google.com/functions/docs/bestpractices/tips#do_not_start_background_activities
 
-    await pythonEnvironment.terminate();
-    await pythonEnvironment.cleanup();
+        await pythonEnvironment.terminate();
+        await pythonEnvironment.cleanup();
+    } else {
+        console.log(`Session ${sessionId} preserved for stateful execution`);
+    }
 
     // to make gcp run it until the promise resolves & only now close the response connection
     res.end()
