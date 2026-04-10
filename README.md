@@ -1,3 +1,5 @@
+# ⚠️ No longer maintained: This repository is archived and no longer supported. If you wish to continue development, please fork the project.
+
 # Terrarium - A Simple Python Sandbox
 
 Terrarium is a relatively low latency, easy to use, and economical Python sandbox - to be used as a docker deployed container, for example in GCP Cloud Run - for executing untrusted user or LLM generated ``python`` code.
