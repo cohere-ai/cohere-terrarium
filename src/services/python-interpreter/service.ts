@@ -8,15 +8,27 @@ import { CodeExecutionResponse, FileData, PythonEnvironment } from "./types";
 const pythonEnvironmentHomeDir = "/home/earth";
 const defaultDirectoryOuterPath = 'default_python_home';
 
+interface SessionEnvironment {
+    pyodide: PyodideInterface;
+    interruptBuffer: SharedArrayBuffer;
+    interrupt: Uint8Array;
+    out_string: string;
+    err_string: string;
+    createdAt: number; // timestamp to track session age
+}
+
 export class PyodidePythonEnvironment implements PythonEnvironment {
-    out_string = ""
-    err_string = ""
     default_files: any[] = []
     default_file_names = new Set()
 
-    pyodide?: PyodideInterface;
-    interruptBufferPyodide = new SharedArrayBuffer(4);
-    interrupt = new Uint8Array(this.interruptBufferPyodide);
+    // For backward compatibility (stateless execution)
+    private defaultPyodideEnv?: SessionEnvironment;
+
+    // For session-based execution
+    private sessionEnvironments: Map<string, SessionEnvironment> = new Map();
+
+    // Maximum session age - clean up sessions older than this (in milliseconds)
+    private readonly MAX_SESSION_AGE = 30 * 60 * 1000; // 30 minutes
 
     async prepareEnvironment() {
         console.log("Preparing Pyodide environment");
@@ -32,71 +44,101 @@ export class PyodidePythonEnvironment implements PythonEnvironment {
         });
     }
 
-    async loadEnvironment(): Promise<void> {
-        console.log("Loading Pyodide environment");
-        this.interrupt[0] = 0;
-        this.out_string = ""
-        this.err_string = ""
-        this.pyodide = await loadPyodide({
-            packageCacheDir: "pyodide_cache", // allows us to cache the packages in the cloud function deployment
-            stdout: msg => { this.out_string += msg + "\n" },
-            stderr: msg => { this.err_string += msg + "\n" },
-            jsglobals: {
-                clearInterval, clearTimeout, setInterval, setTimeout,
-                // the following need some explanation:
-                // we need to provide a fake ImageData & document object to pyodide, because matplotlib-pyodide polyfills try to access them when initializing
-                // BUT luckily for us matplotlib-pyodide does not actually use them for .savefig rendering (only for .show()), so we can just provide empty objects
-                ImageData: {}, document: {
-                    getElementById: (id: any) => {
-                        if (id.includes("canvas")) return null; // lol don't ask ... this is needed! https://github.com/pyodide/matplotlib-pyodide/blob/61935f72718c0754a9b94e1569a685ad3c50ae91/matplotlib_pyodide/wasm_backend.py#L48
-                        else return {
-                            addEventListener: () => { },
-                            style: {},
-                            classList: { add: () => { }, remove: () => { } },
-                            setAttribute: () => { },
-                            appendChild: () => { },
-                            remove: () => { },
+    private createPyodideEnvironment(basePath: string = pythonEnvironmentHomeDir): Promise<SessionEnvironment> {
+        return new Promise(async (resolve, reject) => {
+            try {
+                console.log(`Creating Pyodide environment for path: ${basePath}`);
+
+                const interruptBuffer = new SharedArrayBuffer(4);
+                const interrupt = new Uint8Array(interruptBuffer);
+
+                const pyodide: PyodideInterface = await loadPyodide({
+                    packageCacheDir: "pyodide_cache", // allows us to cache the packages in the cloud function deployment
+                    stdout: msg => { /* intentionally left empty for sessions */ },
+                    stderr: msg => { /* intentionally left empty for sessions */ },
+                    jsglobals: {
+                        clearInterval, clearTimeout, setInterval, setTimeout,
+                        // the following need some explanation:
+                        // we need to provide a fake ImageData & document object to pyodide, because matplotlib-pyodide polyfills try to access them when initializing
+                        // BUT luckily for us matplotlib-pyodide does not actually use them for .savefig rendering (only for .show()), so we can just provide empty objects
+                        ImageData: {}, document: {
+                            getElementById: (id: any) => {
+                                if (id.includes("canvas")) return null; // lol don't ask ... this is needed! https://github.com/pyodide/matplotlib-pyodide/blob/61935f72718c0754a9b94e1569a685ad3c50ae91/matplotlib_pyodide/wasm_backend.py#L48
+                                else return {
+                                    addEventListener: () => { },
+                                    style: {},
+                                    classList: { add: () => { }, remove: () => { } },
+                                    setAttribute: () => { },
+                                    appendChild: () => { },
+                                    remove: () => { },
+                                }
+                            },
+                            createElement: () => ({
+                                addEventListener: () => { },
+                                style: {},
+                                classList: { add: () => { }, remove: () => { } },
+                                setAttribute: () => { },
+                                appendChild: () => { },
+                                remove: () => { },
+                            }),
+                            createTextNode: () => ({
+                                addEventListener: () => { },
+                                style: {},
+                                classList: { add: () => { }, remove: () => { } },
+                                setAttribute: () => { },
+                                appendChild: () => { },
+                                remove: () => { },
+                            }),
+                            body: {
+                                appendChild: () => { },
+                            },
                         }
-                    },
-                    createElement: () => ({
-                        addEventListener: () => { },
-                        style: {},
-                        classList: { add: () => { }, remove: () => { } },
-                        setAttribute: () => { },
-                        appendChild: () => { },
-                        remove: () => { },
-                    }),
-                    createTextNode: () => ({
-                        addEventListener: () => { },
-                        style: {},
-                        classList: { add: () => { }, remove: () => { } },
-                        setAttribute: () => { },
-                        appendChild: () => { },
-                        remove: () => { },
-                    }),
-                    body: {
-                        appendChild: () => { },
-                    },
-                }
-            }, // removing any way for python to access any of the hosts js functions or variables
-            env: { "HOME": pythonEnvironmentHomeDir } // using a non-descriptive home dir
+                    }, // removing any way for python to access any of the hosts js functions or variables
+                    env: { "HOME": basePath } // using a non-descriptive home dir
+                });
+
+                // write the default files from default_python_home to the pyodide file system
+                this.default_files.forEach((f) => {
+                    pyodide.FS.writeFile(pyodide.PATH.join2(basePath, f.filename), f.byte_data);
+                })
+
+                // load the packages we commonly use to avoid the latency hit during the user req
+                await pyodide.loadPackage(["numpy", "matplotlib", "pandas"]);
+
+                // set interrupt buffer to allow for termination
+                pyodide.setInterruptBuffer(interrupt);
+
+                // second part of the import (also takes a latency hit), its ok to re-import packages
+                await pyodide.runPythonAsync("import matplotlib.pyplot as plt\nimport pandas as pd\nimport numpy as np");
+
+                const sessionEnv: SessionEnvironment = {
+                    pyodide,
+                    interruptBuffer,
+                    interrupt,
+                    out_string: "",
+                    err_string: "",
+                    createdAt: Date.now(),
+                };
+
+                console.log(`Pyodide is loaded for path: ${basePath}`);
+
+                resolve(sessionEnv);
+            } catch (error) {
+                console.error('Error creating Pyodide environment:', error);
+                reject(error);
+            }
         });
+    }
 
-        let pyodide = this.pyodide!;
-        // write the default files from default_python_home to the pyodide file system
-        this.default_files.forEach((f) => {
-            pyodide.FS.writeFile(pyodide?.PATH.join2(pythonEnvironmentHomeDir, f.filename), f.byte_data);
-        })
-        // load the packages we commonly use to avoid the latency hit during the user req
-        await pyodide.loadPackage(["numpy", "matplotlib", "pandas"])
+    async loadEnvironment(): Promise<void> {
+        console.log("Loading default Pyodide environment");
+        const defaultEnv = await this.createPyodideEnvironment();
 
-        // set interrupt buffer to allow for termination
-        pyodide.setInterruptBuffer(this.interrupt);
-
-        // second part of the import (also takes a latency hit), its ok to re-import packages
-        await pyodide.runPythonAsync("import matplotlib.pyplot as plt\nimport pandas as pd\nimport numpy as np")
-        console.log("Pyodide is loaded with packages imported")
-        return Promise.resolve();
+        // Now add the default output handlers to the default environment for backward compatibility
+        // We keep these as instance variables for backward compatibility
+        this.defaultPyodideEnv = defaultEnv;
+        this.defaultPyodideEnv.pyodide.setStdout({ batched: (msg) => { this.defaultPyodideEnv!.out_string += msg + "\n"; } });
+        this.defaultPyodideEnv.pyodide.setStderr({ batched: (msg) => { this.defaultPyodideEnv!.err_string += msg + "\n"; } });
     }
 
     async init(): Promise<void> {
@@ -105,16 +147,16 @@ export class PyodidePythonEnvironment implements PythonEnvironment {
     }
 
     async waitForReady(): Promise<void> {
-        //TODO won't need this in 2nd iteration
-        if (!this.pyodide) {
+        // For backward compatibility (stateless execution)
+        if (!this.defaultPyodideEnv) {
             let max_tries = 0
-            while (max_tries < 100 && this.pyodide == null) {
+            while (max_tries < 100 && this.defaultPyodideEnv == null) {
                 await waitFor(100);
                 max_tries++;
             }
         }
 
-        if (this.pyodide == null) {
+        if (this.defaultPyodideEnv == null) {
             console.error("pyodide is still not loaded after waiting")
             return Promise.reject("pyodide is still not loaded after waiting")
         }
@@ -122,12 +164,37 @@ export class PyodidePythonEnvironment implements PythonEnvironment {
         return Promise.resolve();
     }
 
-    async terminate(): Promise<void> {
-        // terminating to avoid leak (noticed packages are loaded twice with loadEnvironment the second time)
-        this.interrupt[0] = 1;
+    async terminate(sessionId?: string): Promise<void> {
+        if (sessionId) {
+            // For a specific session
+            const sessionEnv = this.sessionEnvironments.get(sessionId);
+            if (sessionEnv) {
+                sessionEnv.interrupt[0] = 1;
+                // Clear interrupt buffer after termination
+                sessionEnv.interrupt[0] = 0;
+            }
+        } else {
+            // For backward compatibility (default environment)
+            if (this.defaultPyodideEnv) {
+                this.defaultPyodideEnv.interrupt[0] = 1;
+                // Clear interrupt buffer after termination
+                this.defaultPyodideEnv.interrupt[0] = 0;
+            }
+        }
     }
-    async cleanup(): Promise<void> {
-        return this.loadEnvironment();
+
+    async cleanup(sessionId?: string): Promise<void> {
+        if (sessionId) {
+            // Clean up a specific session
+            const sessionEnv = this.sessionEnvironments.get(sessionId);
+            if (sessionEnv) {
+                sessionEnv.interrupt[0] = 1;
+                this.sessionEnvironments.delete(sessionId);
+            }
+        } else {
+            // For backward compatibility (default environment)
+            await this.loadEnvironment();
+        }
     }
 
 
@@ -145,12 +212,14 @@ export class PyodidePythonEnvironment implements PythonEnvironment {
 
     /**
      * Function to recursively list files in the pyodide file system from the given directory.
-     * @param {string} dir 
+     * @param {SessionEnvironment} sessionEnv - The environment whose file system to list
+     * @param {string} dir - The directory to list
      * @returns list of file paths
      */
-    listFilesRecursive(dir: string) {
+    private listFilesRecursive(sessionEnv: SessionEnvironment, dir: string): string[] {
+        const pyodide = sessionEnv.pyodide;
         var files: any[] = [];
-        var entries = this.pyodide?.FS.readdir(dir);
+        var entries = pyodide.FS.readdir(dir);
 
         for (var i = 0; i < entries.length; i++) {
             var entry = entries[i];
@@ -162,11 +231,11 @@ export class PyodidePythonEnvironment implements PythonEnvironment {
                 // Skip default files
                 continue;
             }
-            var fullPath = this.pyodide?.PATH.join2(dir, entry);
+            var fullPath = pyodide.PATH.join2(dir, entry);
 
-            if (this.pyodide?.FS.isDir(this.pyodide.FS.stat(fullPath).mode)) {
+            if (pyodide.FS.isDir(pyodide.FS.stat(fullPath).mode)) {
                 // If it's a directory, recursively list files in that directory
-                files = files.concat(this.listFilesRecursive(fullPath));
+                files = files.concat(this.listFilesRecursive(sessionEnv, fullPath));
             } else {
                 // If it's a file, add it to the list
                 files.push(fullPath);
@@ -178,39 +247,97 @@ export class PyodidePythonEnvironment implements PythonEnvironment {
 
     /**
      * Reads a file from the pyodide file system from the given file path and returns its content as a base64 encoded string.
+     * @param {SessionEnvironment} sessionEnv - The environment whose file system to read from
      * @param {string} filePath - The path of the file to be read.
      * @returns {string} - The base64 encoded content of the file.
      */
-    readFileAsBase64(filePath: string) {
-        var fileData = this.pyodide!.FS.readFile(filePath, { encoding: 'binary' });
+    private readFileAsBase64(sessionEnv: SessionEnvironment, filePath: string): string {
+        const pyodide = sessionEnv.pyodide;
+        var fileData = pyodide.FS.readFile(filePath, { encoding: 'binary' });
         return this.bytesToBase64(fileData);
     }
+
     /**
      * Transforms a byte array into a base64 encoded string.
      * @param {Uint8Array} bytes the raw bytes to encode as base64
      * @returns base64 encoded string
      */
-    bytesToBase64(bytes: any) {
+    private bytesToBase64(bytes: any): string {
         const binString = String.fromCodePoint(...bytes);
         return btoa(binString);
     }
 
     /**
      * transforms a base64 encoded string into a byte array.
-     * @param {string} base64 
+     * @param {string} base64
      * @returns Uint8Array of bytes
      */
-    base64ToBytes(base64: any) {
+    private base64ToBytes(base64: any): Uint8Array {
         const binString = atob(base64);
         return (Uint8Array as any).from(binString, (m: any) => m.codePointAt(0));
     }
 
+    /**
+     * Ensure all active sessions are still valid by removing expired ones
+     */
+    private async cleanExpiredSessions(): Promise<void> {
+        const now = Date.now();
+        for (const [sessionId, sessionEnv] of this.sessionEnvironments.entries()) {
+            if (now - sessionEnv.createdAt > this.MAX_SESSION_AGE) {
+                console.log(`Cleaning up expired session: ${sessionId}`);
+                await this.cleanup(sessionId);
+            }
+        }
+    }
 
-    async runCode(code: string, files: any[]): Promise<CodeExecutionResponse> {
+    /**
+     * Get the session environment for the given session ID, creating it if it doesn't exist
+     */
+    private async getSessionEnvironment(sessionId: string): Promise<SessionEnvironment> {
+        let sessionEnv = this.sessionEnvironments.get(sessionId);
+
+        if (!sessionEnv) {
+            console.log(`Creating new session environment: ${sessionId}`);
+            sessionEnv = await this.createPyodideEnvironment(`${pythonEnvironmentHomeDir}_${sessionId}`);
+
+            // Set custom output handlers for this session
+            sessionEnv.pyodide.setStdout({ batched: (msg) => { sessionEnv!.out_string += msg + "\n"; } });
+            sessionEnv.pyodide.setStderr({ batched: (msg) => { sessionEnv!.err_string += msg + "\n"; } });
+
+            this.sessionEnvironments.set(sessionId, sessionEnv);
+        }
+
+        return sessionEnv;
+    }
+
+    async runCode(code: string, files: any[], sessionId?: string): Promise<CodeExecutionResponse> {
         const startCode = Date.now();
-        let pyodide = this.pyodide!;
+
+        // Clean up expired sessions periodically
+        await this.cleanExpiredSessions();
+
+        let sessionEnv: SessionEnvironment;
+
+        if (sessionId) {
+            // Stateful execution: use session-specific environment
+            sessionEnv = await this.getSessionEnvironment(sessionId);
+        } else {
+            // Backward compatibility: use default stateless environment
+            if (!this.defaultPyodideEnv) {
+                throw new Error("Default environment not initialized");
+            }
+            sessionEnv = this.defaultPyodideEnv;
+        }
+
+        // Clear the output strings for this run
+        sessionEnv.out_string = "";
+        sessionEnv.err_string = "";
+
         let result: CodeExecutionResponse = { success: true };
+
         try {
+            const pyodide = sessionEnv.pyodide;
+
             // load available and needed packages - only supports pyodide built-in packages
             await pyodide.loadPackagesFromImports(code)
 
@@ -223,9 +350,10 @@ export class PyodidePythonEnvironment implements PythonEnvironment {
                     result.error = { type: "parsing", message: "file data is missing for: " + JSON.stringify(f) }
                     return result;
                 }
-                // TODO make sure to create subdirectories if the file is in a subdirectory path
-                pyodide.FS.writeFile(pyodide?.PATH.join2(pythonEnvironmentHomeDir, f.filename), this.base64ToBytes(f.b64_data));
-            })
+                // Determine the base path depending on whether this is a session or stateless
+                const basePath = sessionId ? `${pythonEnvironmentHomeDir}_${sessionId}` : pythonEnvironmentHomeDir;
+                pyodide.FS.writeFile(pyodide.PATH.join2(basePath, f.filename), this.base64ToBytes(f.b64_data));
+            });
 
 
             //
@@ -235,14 +363,15 @@ export class PyodidePythonEnvironment implements PythonEnvironment {
             //
             // soak up newly created files and return them as output
             //
-            var allFiles = this.listFilesRecursive(pythonEnvironmentHomeDir);
+            const basePath = sessionId ? `${pythonEnvironmentHomeDir}_${sessionId}` : pythonEnvironmentHomeDir;
+            var allFiles = this.listFilesRecursive(sessionEnv, basePath);
 
             // get only the new files (not in the input files) and read as base64
             let input_file_names = files.map(f => f.filename)
             let new_files = allFiles
-                .filter(f => !input_file_names.includes(f.slice(pythonEnvironmentHomeDir.length + 1)))
+                .filter(f => !input_file_names.includes(f.slice(basePath.length + 1)))
                 .map(f => {
-                    return { "filename": f.slice(pythonEnvironmentHomeDir.length + 1), "b64_data": this.readFileAsBase64(f) } //"content": decodeBase64ToText(readFileAsBase64(f))
+                    return { "filename": f.slice(basePath.length + 1), "b64_data": this.readFileAsBase64(sessionEnv, f) };
                 });
 
             console.log("output files:", new_files.map(f => f.filename + " " + f.b64_data.slice(0, 10) + "... " + f.b64_data.length));
@@ -250,13 +379,13 @@ export class PyodidePythonEnvironment implements PythonEnvironment {
 
             let result_reporting = ""
             if (interpreterResult != undefined) {
-                result_reporting = result.toString().replace(/\n/g, '\\n');
+                result_reporting = interpreterResult.toString().replace(/\n/g, '\\n');
             }
 
             console.log("[Success] Code:", (code as any).replace(/\n/g, '\\n'),
                 "final_expression:", result_reporting,
-                "stdout:", this.out_string.replace(/\n/g, '\\n'),
-                "stderr:", this.err_string.replace(/\n/g, '\\n'));
+                "stdout:", sessionEnv.out_string.replace(/\n/g, '\\n'),
+                "stderr:", sessionEnv.err_string.replace(/\n/g, '\\n'));
 
 
             result.final_expression = interpreterResult;
@@ -286,9 +415,20 @@ export class PyodidePythonEnvironment implements PythonEnvironment {
             result.success = false
         }
 
-        result.std_out = this.out_string;
-        result.std_err = this.err_string;
+        result.std_out = sessionEnv.out_string;
+        result.std_err = sessionEnv.err_string;
         result.code_runtime = (Date.now() - startCode)
+
+        // For backward compatibility (stateless execution), clean up the environment after execution
+        if (!sessionId) {
+            // Reset the output strings for the default environment
+            sessionEnv.out_string = "";
+            sessionEnv.err_string = "";
+
+            // Note: We're not recycling the default environment here for performance
+            // If needed for security, we could call cleanup() on the default environment
+        }
+
         return result;
     }
 }

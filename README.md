@@ -14,6 +14,7 @@ Terrarium is a relatively low latency, easy to use, and economical Python sandbo
 
 Using the deployed Cloud Run is super easy - just call it with the `code` to run & authorization bearer (if so configured) as follows:
 
+### Stateless Execution (Default)
 ```bash
 curl -X POST --url <name of your deployed gcp cloud run> \
 -H "Authorization: bearer $(gcloud auth print-identity-token)" \
@@ -26,6 +27,34 @@ which returns:
 ```json
 {"output_files":[],"final_expression":2,"success":true,"std_out":"","std_err":"","code_runtime":16}
 ```
+
+### Stateful Execution with Sessions
+To maintain state between multiple requests, you can use the optional `sessionId` parameter. This allows variables, functions, and other state to persist between multiple calls:
+
+```bash
+curl -X POST --url <name of your deployed gcp cloud run> \
+-H "Authorization: bearer $(gcloud auth print-identity-token)" \
+-H "Content-Type: application/json" \
+--no-buffer \
+--data-raw '{"code": "x = 10", "sessionId": "my-session-123"}'
+```
+
+Then in a subsequent call with the same session ID, you can access the previously defined variable:
+
+```bash
+curl -X POST --url <name of your deployed gcp cloud run> \
+-H "Authorization: bearer $(gcloud auth print-identity-token)" \
+-H "Content-Type: application/json" \
+--no-buffer \
+--data-raw '{"code": "x * 2", "sessionId": "my-session-123"}'
+```
+
+which returns:
+```json
+{"output_files":[],"final_expression":20,"success":true,"std_out":"","std_err":"","code_runtime":12}
+```
+
+Sessions are automatically cleaned up after 30 minutes of inactivity to prevent resource exhaustion.
 
 The authentication `gcloud auth print-identity-token` needs to be renewed every hour.
 
