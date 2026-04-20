@@ -1,4 +1,4 @@
-# ⚠️ No longer maintained: This repository is archived and no longer supported. If you wish to continue development, please fork the project.
+# ⚠️ No longer maintained: This repository is archived and no longer supported.
 
 # Terrarium - A Simple Python Sandbox
 
