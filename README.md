@@ -62,6 +62,22 @@ https://pyodide.org/en/stable/usage/packages-in-pyodide.html including, but not 
 - scipy
 - sqlite3 (not enabled by default, but we could load it as well)
 
+To get the full list of supported packages, you can run the following:
+
+```bash
+curl -X GET -H "Content-Type: application/json" --url http://localhost:8080/available-packages
+```
+
+You can also specify a list of forbidden packages (those that are prohibited from being loaded and used in the code). To define them, use the following request:
+```bash
+curl -X POST -H "Content-Type: application/json" --url http://localhost:8080/forbidden-packages \
+--data-raw '{"packages": ["micropip","requests","aiohttp","urllib3","fsspec","smart_open","pyodide-http"]}'
+``` 
+To get the list of forbidden packages, you can run the following:
+```bash
+curl -X GET -H "Content-Type: application/json" --url http://localhost:8080/forbidden-packages
+```
+
 ## Development
 
 You need node.js installed on your system. To install dependencies run:

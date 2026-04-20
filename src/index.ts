@@ -1,8 +1,8 @@
-import { PyodideInterface, loadPyodide } from 'pyodide';
-import express, { Express, Request, Response } from "express";
+import express, { Express } from "express";
 import { PyodidePythonEnvironment } from '../src/services/python-interpreter/service';
 import { PythonEnvironment } from './services/python-interpreter/types';
 import { doWithLock } from './utils/async-utils';
+import {getAvailablePackages, getForbiddenPackages, setForbiddenPackages} from "./utils/packages-utils";
 
 
 const pythonEnvironment: PythonEnvironment = new PyodidePythonEnvironment();
@@ -61,6 +61,25 @@ terrariumApp.post('', async (req, res) => {
 
 terrariumApp.get('/health', (req, res) => {
     res.send("hi!");
+});
+
+terrariumApp.post('/forbidden-packages', (req, res) => {
+    const packages = req.body.packages;
+    if (packages == undefined || !Array.isArray(packages)) {
+        res.status(400).send("Forbidden packages must be an array of strings.");
+        return;
+    }
+    setForbiddenPackages(packages);
+    res.send("Forbidden packages updated.");
+});
+
+terrariumApp.get('/forbidden-packages', (req, res) => {
+    res.send({"packages": getForbiddenPackages()});
+});
+
+
+terrariumApp.get('/available-packages', (req, res) => {
+    res.send({"packages": getAvailablePackages()});
 });
 
 

@@ -1,12 +1,13 @@
 import { PyodideInterface, loadPyodide } from "pyodide";
-import { waitFor } from "../../utils/async-utils";
+import {waitFor} from "../../utils/async-utils";
 import { promises as fs } from 'fs';
 import * as path from 'path';
 import { CodeExecutionResponse, FileData, PythonEnvironment } from "./types";
-
+import {getForbiddenPackages} from '../../utils/packages-utils';
 
 const pythonEnvironmentHomeDir = "/home/earth";
 const defaultDirectoryOuterPath = 'default_python_home';
+
 
 export class PyodidePythonEnvironment implements PythonEnvironment {
     out_string = ""
@@ -212,8 +213,8 @@ export class PyodidePythonEnvironment implements PythonEnvironment {
         let result: CodeExecutionResponse = { success: true };
         try {
             // load available and needed packages - only supports pyodide built-in packages
-            await pyodide.loadPackagesFromImports(code)
-
+            const loadedPackages = await this.loadPackagesWithForbiddenImportsChecks(code);
+            console.log("Loaded packages:", loadedPackages.map(pkg => pkg.name));
             //
             // write the input files to the pyodide file system
             //
@@ -290,5 +291,16 @@ export class PyodidePythonEnvironment implements PythonEnvironment {
         result.std_err = this.err_string;
         result.code_runtime = (Date.now() - startCode)
         return result;
+    }
+    async loadPackagesWithForbiddenImportsChecks(code: string) {
+        // Disallow forbidden packages in imports
+        let pyodide = this.pyodide!
+        const packages = await pyodide.loadPackagesFromImports(code)
+        const forbiddenPackages = getForbiddenPackages();
+        const checkResult = packages.every(pkg => !forbiddenPackages.includes(pkg.name));
+        if (!checkResult) {
+            throw new Error("Forbidden package detected in imports");
+        }
+        return packages;
     }
 }
