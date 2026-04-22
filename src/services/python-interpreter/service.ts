@@ -8,6 +8,38 @@ import { CodeExecutionResponse, FileData, PythonEnvironment } from "./types";
 const pythonEnvironmentHomeDir = "/home/earth";
 const defaultDirectoryOuterPath = 'default_python_home';
 
+// CVE-2026-5752 hardening:
+// Plain `{}` literals inherit from Object.prototype, which lets sandboxed
+// Pyodide code walk the prototype chain (e.g. `({}).constructor.constructor`)
+// to reach the host Function constructor, obtain the host `globalThis`, and
+// from there reach Node.js internals such as `require`. Building every object
+// exposed to the sandbox with a NULL prototype (`Object.create(null)`)
+// removes the chain so `.constructor` resolves to undefined.
+//
+// Some mocks must remain writable because matplotlib-pyodide assigns to them
+// during figure init (e.g. `style_element.id = "..."`,
+// `el.style.display = "none"`). Freezing those objects causes Pyodide to
+// throw a TypeError mid-`plt.subplots()` and breaks all matplotlib output.
+// `nullProto` keeps the mock writable; `sealed` also freezes for objects
+// that are only read or only have their methods called.
+function nullProto<T extends object>(props: T): T {
+    return Object.assign(Object.create(null) as T, props);
+}
+function sealed<T extends object>(props: T): Readonly<T> {
+    return Object.freeze(nullProto(props));
+}
+const noop = () => { /* no-op DOM stub */ };
+// `elementStub` and its `style` are NOT frozen: matplotlib-pyodide writes
+// `.id`, `.textContent`, `.style.display`, etc. on returned elements.
+const elementStub = () => nullProto({
+    addEventListener: noop,
+    style: nullProto({}),
+    classList: sealed({ add: noop, remove: noop }),
+    setAttribute: noop,
+    appendChild: noop,
+    remove: noop,
+});
+
 export class PyodidePythonEnvironment implements PythonEnvironment {
     out_string = ""
     err_string = ""
@@ -41,44 +73,34 @@ export class PyodidePythonEnvironment implements PythonEnvironment {
             packageCacheDir: "pyodide_cache", // allows us to cache the packages in the cloud function deployment
             stdout: msg => { this.out_string += msg + "\n" },
             stderr: msg => { this.err_string += msg + "\n" },
+            // we need to provide fake ImageData & document objects to pyodide, because matplotlib-pyodide polyfills try to access them when initializing
+            // BUT luckily for us matplotlib-pyodide does not actually use them for .savefig rendering (only for .show()), so we can just provide empty objects
+            //
+            // SECURITY (CVE-2026-5752): every object **the Python sandbox can
+            // reach via `import js`** MUST be built with `Object.create(null)`
+            // (via `sealed`) so the sandbox cannot walk
+            // Object.prototype -> Function -> globalThis -> require.
+            //
+            // The outer `jsglobals` container is intentionally a plain object:
+            // Pyodide writes its own bookkeeping into the globals at runtime,
+            // and freezing the container silently drops those writes (which
+            // later manifests as `'hiwire_call_bound' in undefined` when
+            // Pyodide tries to walk a JS error stack). It is the *values*
+            // exposed to the sandbox that need null prototypes, not the
+            // container Pyodide owns.
             jsglobals: {
                 clearInterval, clearTimeout, setInterval, setTimeout,
-                // the following need some explanation:
-                // we need to provide a fake ImageData & document object to pyodide, because matplotlib-pyodide polyfills try to access them when initializing
-                // BUT luckily for us matplotlib-pyodide does not actually use them for .savefig rendering (only for .show()), so we can just provide empty objects
-                ImageData: {}, document: {
+                ImageData: Object.freeze(Object.create(null)),
+                document: sealed({
                     getElementById: (id: any) => {
                         if (id.includes("canvas")) return null; // lol don't ask ... this is needed! https://github.com/pyodide/matplotlib-pyodide/blob/61935f72718c0754a9b94e1569a685ad3c50ae91/matplotlib_pyodide/wasm_backend.py#L48
-                        else return {
-                            addEventListener: () => { },
-                            style: {},
-                            classList: { add: () => { }, remove: () => { } },
-                            setAttribute: () => { },
-                            appendChild: () => { },
-                            remove: () => { },
-                        }
+                        return elementStub();
                     },
-                    createElement: () => ({
-                        addEventListener: () => { },
-                        style: {},
-                        classList: { add: () => { }, remove: () => { } },
-                        setAttribute: () => { },
-                        appendChild: () => { },
-                        remove: () => { },
-                    }),
-                    createTextNode: () => ({
-                        addEventListener: () => { },
-                        style: {},
-                        classList: { add: () => { }, remove: () => { } },
-                        setAttribute: () => { },
-                        appendChild: () => { },
-                        remove: () => { },
-                    }),
-                    body: {
-                        appendChild: () => { },
-                    },
-                }
-            }, // removing any way for python to access any of the hosts js functions or variables
+                    createElement: () => elementStub(),
+                    createTextNode: () => elementStub(),
+                    body: sealed({ appendChild: noop }),
+                }),
+            },
             env: { "HOME": pythonEnvironmentHomeDir } // using a non-descriptive home dir
         });
 
